@@ -114,7 +114,7 @@ cmd({
 
         const args = text.split(' ');
         let channelInput = args[0];
-        let statusText = args.slice(1).join(' ');
+        let statusText = args.slice(1).join(' ').trim();
 
         if (!channelInput) {
             return await reply("⚠️ *Usage:*\n`.cs <channel_link_or_jid> <text>`\n\n*Example:*\n`.cs https://whatsapp.com/channel/xxxx Hello followers!`\n\n_Reply to an image/video/voice/text to post a media status._");
@@ -123,7 +123,6 @@ cmd({
         // 1. Resolve Channel Link to JID
         let channelJid = channelInput;
         if (channelInput.includes('whatsapp.com/channel/')) {
-            await reply("🔍 Resolving channel link...");
             const resolved = await resolveChannelLink(client, channelInput);
             if (!resolved) return await reply("❌ Could not resolve that channel link. Make sure the link is valid.");
             channelJid = resolved;
@@ -139,13 +138,11 @@ cmd({
         let qType = '';
         let qMsg = {};
 
-        // ==================== EXTRACT QUOTED CONTENT (Like Forward) ====================
-        const quotedContent = m.msg?.contextInfo?.quotedMessage;
-        
-        if (quotedContent) {
-            const messageContent = { ...quotedContent };
-            qType = Object.keys(messageContent).find(k => k !== 'messageContextInfo') || '';
-            qMsg = messageContent[qType] || {};
+        // ==================== EXTRACT QUOTED CONTENT ====================
+        if (m.quoted) {
+            const quotedContent = m.quoted.message || {};
+            qType = Object.keys(quotedContent).find(k => k !== 'messageContextInfo') || '';
+            qMsg = quotedContent[qType] || {};
 
             const needsMedia = ['audioMessage', 'imageMessage', 'videoMessage'].includes(qType);
             if (needsMedia) {
@@ -155,9 +152,13 @@ cmd({
                         await reply("🎙️ Converting audio to Voice Note...");
                         voiceBuf = await convertToVoiceNote(mediaBuffer);
                     }
-                } catch (e) {}
+                } catch (e) {
+                    console.error("Media download failed:", e);
+                }
             } else if (qType === 'conversation' || qType === 'extendedTextMessage') {
-                if (!statusText) statusText = m.quoted.text || "";
+                if (!statusText) {
+                    statusText = m.quoted.text || qMsg.text || "";
+                }
             }
         }
 
@@ -198,7 +199,6 @@ cmd({
                     }
                 };
             }
-            // STRIP METADATA
             stripContextInfo(finalContent);
             
         } else if (statusText) {
@@ -252,7 +252,7 @@ cmd({
             throw new Error(`❌ WhatsApp rejected the status (Error ${response.attrs.error})`);
         }
         if (!response?.attrs?.server_id) {
-            throw new Error("❌ Your channel is not eligible for status.");
+            throw new Error("❌ Your channel is not eligible (No server ID returned). This may be due to rate limits or channel restrictions.");
         }
 
         // 5. Success
