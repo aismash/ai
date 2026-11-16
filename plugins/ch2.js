@@ -25,7 +25,6 @@ function generateTraceId() {
 }
 
 // ==================== HELPER: EXTRACT RAW CONTENT ====================
-// The official Baileys logic for extracting whitelisted fields to create a valid report token.
 const reportingFields = [
 	{ f: 1 }, { f: 3, s: [{ f: 2 }, { f: 3 }, { f: 8 }, { f: 11 }, { f: 17, s: [{ f: 21 }, { f: 22 }] }, { f: 25 }] },
 	{ f: 4, s: [{ f: 1 }, { f: 16 }, { f: 17, s: [{ f: 21 }, { f: 22 }] }] },
@@ -60,6 +59,30 @@ const compileReportingFields = (fields) => {
 const compiledReportingFields = compileReportingFields(reportingFields);
 const EMPTY_MAP = new Map();
 const WIRE = { VARINT: 0, FIXED64: 1, BYTES: 2, FIXED32: 5 };
+
+const decodeVarint = (buffer, offset) => {
+	let value = 0, bytes = 0, shift = 0;
+	while (offset + bytes < buffer.length) {
+		const current = buffer[offset + bytes];
+		value |= (current & 0x7f) << shift;
+		bytes++;
+		if ((current & 0x80) === 0) return { value, bytes, ok: true };
+		shift += 7;
+		if (shift > 35) return { value: 0, bytes: 0, ok: false };
+	}
+	return { value: 0, bytes: 0, ok: false };
+};
+
+const encodeVarint = (value) => {
+	const parts = [];
+	let remaining = value >>> 0;
+	while (remaining > 0x7f) {
+		parts.push((remaining & 0x7f) | 0x80);
+		remaining >>>= 7;
+	}
+	parts.push(remaining);
+	return Buffer.from(parts);
+};
 
 const extractReportingTokenContent = (data, cfg) => {
 	const out = [];
@@ -132,29 +155,8 @@ const extractReportingTokenContent = (data, cfg) => {
 	return Buffer.concat(out.map(f => f.bytes));
 };
 
-const decodeVarint = (buffer, offset) => {
-	let value = 0, bytes = 0, shift = 0;
-	while (offset + bytes < buffer.length) {
-		const current = buffer[offset + bytes];
-		value |= (current & 0x7f) << shift;
-		bytes++;
-		if ((current & 0x80) === 0) return { value, bytes, ok: true };
-		shift += 7;
-		if (shift > 35) return { value: 0, bytes: 0, ok: false };
-	}
-	return { value: 0, bytes: 0, ok: false };
-};
-
-const encodeVarint = (value) => {
-	const parts = [];
-	let remaining = value >>> 0;
-	while (remaining > 0x7f) {
-		parts.push((remaining & 0x7f) | 0x80);
-		remaining >>>= 7;
-	}
-	parts.push(remaining);
-	return Buffer.from(parts);
-};
+const extractReportingTokenContentForMessage = (msgProtobuf) =>
+	extractReportingTokenContent(msgProtobuf, compiledReportingFields);
 
 // ==================== CHANNEL REPORT COMMAND ====================
 cmd({
@@ -216,7 +218,7 @@ cmd({
 
         await reply("⏳ Sending report to WhatsApp...");
 
-        // 3. Build the Spam Report IQ manually (matching buildSpamReportNode logic)
+        // 3. Build the Spam Report IQ
         const traceId = generateTraceId();
         const rawBytes = reportMessage.message ? extractReportingTokenContentForMessage(Buffer.from(proto.Message.encode(reportMessage.message).finish())) : null;
 
