@@ -133,86 +133,81 @@ cmd({
         }
 
         let finalContent = {};
-        let mediaBuffer = null;
-        let voiceBuf = null;
-        let qType = '';
-        let qMsg = {};
 
-        // ==================== EXTRACT QUOTED CONTENT ====================
+        // ==================== EXTRACT QUOTED CONTENT (Using m.quoted like your .vv cmd) ====================
         if (m.quoted) {
-            const quotedContent = m.quoted.message || {};
-            qType = Object.keys(quotedContent).find(k => k !== 'messageContextInfo') || '';
-            qMsg = quotedContent[qType] || {};
+            const mtype = m.quoted.mtype; // Direct mtype, no need for message object keys
+            
+            if (mtype === 'imageMessage' || mtype === 'videoMessage' || mtype === 'audioMessage') {
+                let buffer = await m.quoted.download();
+                if (!buffer) return await reply("❌ Failed to download media.");
+                
+                let mediaType = null;
+                if (mtype === 'imageMessage') mediaType = 'image';
+                else if (mtype === 'videoMessage') mediaType = 'video';
+                else if (mtype === 'audioMessage') mediaType = 'audio';
 
-            const needsMedia = ['audioMessage', 'imageMessage', 'videoMessage'].includes(qType);
-            if (needsMedia) {
-                try {
-                    mediaBuffer = await m.quoted.download();
-                    if (qType === 'audioMessage' && mediaBuffer) {
-                        await reply("🎙️ Converting audio to Voice Note...");
-                        voiceBuf = await convertToVoiceNote(mediaBuffer);
+                if (mediaType === 'audio') {
+                    await reply("🎙️ Converting audio to Voice Note...");
+                    try {
+                        buffer = await convertToVoiceNote(buffer);
+                    } catch (e) {
+                        console.warn("FFmpeg conversion failed:", e.message);
                     }
-                } catch (e) {
-                    console.error("Media download failed:", e);
                 }
-            } else if (qType === 'conversation' || qType === 'extendedTextMessage') {
+
+                const uploaded = await uploadToNewsletter(client, buffer, mediaType);
+
+                if (mediaType === 'audio') {
+                    finalContent = {
+                        audioMessage: {
+                            directPath: uploaded.directPath,
+                            fileSha256: uploaded.fileSha256,
+                            fileLength: uploaded.fileLength,
+                            mimetype: 'audio/ogg; codecs=opus',
+                            ptt: true,
+                            seconds: m.quoted.message?.audioMessage?.seconds || 0
+                        }
+                    };
+                } else {
+                    finalContent = {
+                        [mtype]: {
+                            ...m.quoted.message[mtype],
+                            directPath: uploaded.directPath,
+                            fileSha256: uploaded.fileSha256,
+                            fileLength: uploaded.fileLength,
+                            url: undefined,
+                            mediaKey: undefined,
+                            fileEncSha256: undefined,
+                            mediaKeyTimestamp: undefined,
+                            caption: statusText || m.quoted.text || ""
+                        }
+                    };
+                }
+                stripContextInfo(finalContent);
+            } 
+            // Text Reply (Using m.quoted.text like your .vv command)
+            else {
                 if (!statusText) {
-                    statusText = m.quoted.text || qMsg.text || "";
+                    statusText = m.quoted.text || "";
                 }
             }
         }
 
         // ==================== BUILD FINAL CONTENT ====================
-        if (mediaBuffer) {
-            let mediaType = 'document';
-            if (qType === 'imageMessage') mediaType = 'image';
-            else if (qType === 'videoMessage') mediaType = 'video';
-            else if (qType === 'audioMessage') mediaType = 'audio';
-            else return await reply("❌ Only Image, Video, and Audio/Voice statuses are supported.");
-
-            const uploadBuf = qType === 'audioMessage' ? voiceBuf : mediaBuffer;
-            const uploaded = await uploadToNewsletter(client, uploadBuf, mediaType);
-
-            if (qType === 'audioMessage') {
+        if (Object.keys(finalContent).length === 0) {
+            if (statusText) {
                 finalContent = {
-                    audioMessage: {
-                        directPath: uploaded.directPath,
-                        fileSha256: uploaded.fileSha256,
-                        fileLength: uploaded.fileLength,
-                        mimetype: 'audio/ogg; codecs=opus',
-                        ptt: true,
-                        seconds: qMsg.seconds || 0
+                    extendedTextMessage: {
+                        text: statusText,
+                        backgroundArgb: 0xFF128C7E, 
+                        font: 0 
                     }
                 };
+                stripContextInfo(finalContent);
             } else {
-                finalContent = {
-                    [qType]: {
-                        ...qMsg,
-                        directPath: uploaded.directPath,
-                        fileSha256: uploaded.fileSha256,
-                        fileLength: uploaded.fileLength,
-                        url: undefined,
-                        mediaKey: undefined,
-                        fileEncSha256: undefined,
-                        mediaKeyTimestamp: undefined,
-                        caption: statusText || qMsg.caption || ""
-                    }
-                };
+                return await reply("⚠️ Please provide text, or reply to an image/video/voice/text message.");
             }
-            stripContextInfo(finalContent);
-            
-        } else if (statusText) {
-            finalContent = {
-                extendedTextMessage: {
-                    text: statusText,
-                    backgroundArgb: 0xFF128C7E, 
-                    font: 0 
-                }
-            };
-            stripContextInfo(finalContent);
-        } 
-        else {
-            return await reply("⚠️ Please provide text, or reply to an image/video/voice/text message.");
         }
 
         // 2. Build and Send the Stanza
