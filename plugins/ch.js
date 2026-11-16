@@ -134,31 +134,43 @@ cmd({
 
         let finalContent = {};
 
-        // ==================== EXTRACT QUOTED CONTENT (Using m.quoted like your .vv cmd) ====================
+        // ==================== EXTRACT CONTENT ====================
         if (m.quoted) {
-            const mtype = m.quoted.mtype; // Direct mtype, no need for message object keys
-            
-            if (mtype === 'imageMessage' || mtype === 'videoMessage' || mtype === 'audioMessage') {
-                let buffer = await m.quoted.download();
-                if (!buffer) return await reply("❌ Failed to download media.");
-                
-                let mediaType = null;
-                if (mtype === 'imageMessage') mediaType = 'image';
-                else if (mtype === 'videoMessage') mediaType = 'video';
-                else if (mtype === 'audioMessage') mediaType = 'audio';
+            const quotedContent = m.msg?.contextInfo?.quotedMessage || m.quoted.message;
+            let qType = '';
+            let qMsg = {};
 
-                if (mediaType === 'audio') {
-                    await reply("🎙️ Converting audio to Voice Note...");
-                    try {
-                        buffer = await convertToVoiceNote(buffer);
-                    } catch (e) {
-                        console.warn("FFmpeg conversion failed:", e.message);
+            if (quotedContent) {
+                qType = Object.keys(quotedContent).find(k => k !== 'messageContextInfo') || '';
+                qMsg = quotedContent[qType] || {};
+            }
+
+            const needsMedia = ['audioMessage', 'imageMessage', 'videoMessage'].includes(qType);
+
+            if (needsMedia) {
+                let mediaBuffer = null;
+                let voiceBuf = null;
+                
+                try {
+                    mediaBuffer = await m.quoted.download();
+                    if (qType === 'audioMessage' && mediaBuffer) {
+                        await reply("🎙️ Converting audio to Voice Note...");
+                        voiceBuf = await convertToVoiceNote(mediaBuffer);
                     }
+                } catch (e) {
+                    console.error("Download failed:", e);
+                    return await reply("❌ Failed to download media.");
                 }
 
-                const uploaded = await uploadToNewsletter(client, buffer, mediaType);
+                let mediaType = 'document';
+                if (qType === 'imageMessage') mediaType = 'image';
+                else if (qType === 'videoMessage') mediaType = 'video';
+                else if (qType === 'audioMessage') mediaType = 'audio';
 
-                if (mediaType === 'audio') {
+                const uploadBuf = qType === 'audioMessage' ? voiceBuf : mediaBuffer;
+                const uploaded = await uploadToNewsletter(client, uploadBuf, mediaType);
+
+                if (qType === 'audioMessage') {
                     finalContent = {
                         audioMessage: {
                             directPath: uploaded.directPath,
@@ -166,13 +178,13 @@ cmd({
                             fileLength: uploaded.fileLength,
                             mimetype: 'audio/ogg; codecs=opus',
                             ptt: true,
-                            seconds: m.quoted.message?.audioMessage?.seconds || 0
+                            seconds: qMsg.seconds || 0
                         }
                     };
                 } else {
                     finalContent = {
-                        [mtype]: {
-                            ...m.quoted.message[mtype],
+                        [qType]: {
+                            ...qMsg,
                             directPath: uploaded.directPath,
                             fileSha256: uploaded.fileSha256,
                             fileLength: uploaded.fileLength,
@@ -180,21 +192,20 @@ cmd({
                             mediaKey: undefined,
                             fileEncSha256: undefined,
                             mediaKeyTimestamp: undefined,
-                            caption: statusText || m.quoted.text || ""
+                            caption: statusText || qMsg.caption || m.quoted.text || ""
                         }
                     };
                 }
                 stripContextInfo(finalContent);
-            } 
-            // Text Reply (Using m.quoted.text like your .vv command)
-            else {
+            } else {
+                // Text reply
                 if (!statusText) {
                     statusText = m.quoted.text || "";
                 }
             }
         }
 
-        // ==================== BUILD FINAL CONTENT ====================
+        // ==================== BUILD TEXT IF NO MEDIA ====================
         if (Object.keys(finalContent).length === 0) {
             if (statusText) {
                 finalContent = {
