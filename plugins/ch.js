@@ -1,14 +1,19 @@
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 import { PassThrough } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
 import { cmd } from '../command.js';
 import {
-    proto,
-    generateWAMessageContent,
+    encodeNewsletterMessage,
+    normalizeMessageContent,
     generateMessageIDV2
 } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
+
+// ==================== HELPER: BASE64 ENCODER ====================
+const encodeBase64EncodedStringForUpload = (b64) => 
+    encodeURIComponent(b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/\=+$/, ''));
 
 // ==================== HELPER: VOICE CONVERTER (FFMPEG) ====================
 async function convertToVoiceNote(inputBuffer) {
@@ -30,6 +35,14 @@ async function convertToVoiceNote(inputBuffer) {
     });
 }
 
+// ==================== HELPER: STRIP CONTEXT INFO ====================
+function stripContextInfo(obj) {
+    if (obj && typeof obj === 'object') {
+        delete obj.contextInfo;
+        Object.values(obj).forEach(stripContextInfo);
+    }
+}
+
 // ==================== HELPER: RESOLVE CHANNEL LINK ====================
 async function resolveChannelLink(client, link) {
     const m = link.match(/whatsapp\.com\/channel\/([\w-]+)/i);
@@ -38,6 +51,51 @@ async function resolveChannelLink(client, link) {
         const metadata = await client.newsletterMetadata("invite", m[1]);
         return metadata?.id || null;
     } catch { return null; }
+}
+
+// ==================== HELPER: CUSTOM NEWSLETTER UPLOADER ====================
+async function uploadToNewsletter(client, buffer, mediaType) {
+    const result = await client.query({
+        tag: 'iq',
+        attrs: { type: 'set', xmlns: 'w:m', to: 's.whatsapp.net' },
+        content: [{ tag: 'media_conn', attrs: {} }]
+    });
+    
+    const mediaConn = result.content.find(n => n.tag === 'media_conn');
+    const auth = mediaConn.attrs.auth;
+    const hostname = mediaConn.content.find(n => n.tag === 'host').attrs.hostname;
+
+    const fileSha256 = crypto.createHash('sha256').update(buffer).digest();
+    const fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileSha256.toString('base64'));
+
+    const mediaPathMap = {
+        image: '/newsletter/newsletter-image',
+        video: '/newsletter/newsletter-video',
+        audio: '/newsletter/newsletter-ptt'
+    };
+    
+    const mediaPath = mediaPathMap[mediaType] || '/newsletter/newsletter-audio';
+    const serverThumb = '&server_thumb_gen=1'; 
+    const url = `https://${hostname}${mediaPath}/${fileEncSha256B64}?auth=${encodeURIComponent(auth)}&token=${fileEncSha256B64}${serverThumb}`;
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 
+            'Content-Type': 'application/octet-stream', 
+            'Origin': 'https://web.whatsapp.com' 
+        },
+        body: buffer
+    });
+
+    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+    const json = await res.json();
+
+    return {
+        directPath: json.direct_path,
+        fileSha256,
+        fileLength: buffer.length,
+        mimetype: mediaType === 'audio' ? 'audio/ogg; codecs=opus' : 'application/octet-stream'
+    };
 }
 
 // ==================== CHANNEL STATUS COMMAND ====================
@@ -56,10 +114,10 @@ cmd({
 
         const args = text.split(' ');
         let channelInput = args[0];
-        const statusText = args.slice(1).join(' ');
+        let statusText = args.slice(1).join(' ');
 
         if (!channelInput) {
-            return await reply("⚠️ *Usage:*\n`.cs <channel_link_or_jid> <text>`\n\n*Example:*\n`.cs https://whatsapp.com/channel/xxxx Hello followers!`\n\n_Reply to an image/video/voice to post a media status._");
+            return await reply("⚠️ *Usage:*\n`.cs <channel_link_or_jid> <text>`\n\n*Example:*\n`.cs https://whatsapp.com/channel/xxxx Hello followers!`\n\n_Reply to an image/video/voice/text to post a media status._");
         }
 
         // 1. Resolve Channel Link to JID
@@ -75,86 +133,133 @@ cmd({
             return await reply("❌ Invalid channel JID. It must end with `@newsletter`.");
         }
 
-        let content = {};
-        let options = {};
+        let finalContent = {};
+        let mediaBuffer = null;
+        let voiceBuf = null;
+        let qType = '';
+        let qMsg = {};
 
-        // ==================== HANDLE MEDIA (Image, Video, Audio) ====================
-        if (m.quoted && m.quoted.mtype) {
-            let buffer = await m.quoted.download();
-            if (!buffer) return await reply("❌ Failed to download media.");
+        // ==================== EXTRACT QUOTED CONTENT (Like Forward) ====================
+        const quotedContent = m.msg?.contextInfo?.quotedMessage;
+        
+        if (quotedContent) {
+            const messageContent = { ...quotedContent };
+            qType = Object.keys(messageContent).find(k => k !== 'messageContextInfo') || '';
+            qMsg = messageContent[qType] || {};
 
-            const mtype = m.quoted.mtype;
-
-            if (mtype === 'imageMessage') {
-                content = { image: buffer, caption: statusText || m.quoted.text || '' };
-            } 
-            else if (mtype === 'videoMessage') {
-                content = { video: buffer, caption: statusText || m.quoted.text || '' };
-            } 
-            else if (mtype === 'audioMessage') {
-                await reply("🎙️ Converting audio to Voice Note...");
+            const needsMedia = ['audioMessage', 'imageMessage', 'videoMessage'].includes(qType);
+            if (needsMedia) {
                 try {
-                    buffer = await convertToVoiceNote(buffer);
-                } catch (e) {
-                    console.warn("FFmpeg conversion failed, using original audio:", e.message);
-                }
-                content = { audio: buffer, ptt: true, mimetype: 'audio/ogg; codecs=opus' };
-            } 
-            else {
-                return await reply("❌ Unsupported media type. Only Image, Video, and Audio/Voice are supported.");
+                    mediaBuffer = await m.quoted.download();
+                    if (qType === 'audioMessage' && mediaBuffer) {
+                        await reply("🎙️ Converting audio to Voice Note...");
+                        voiceBuf = await convertToVoiceNote(mediaBuffer);
+                    }
+                } catch (e) {}
+            } else if (qType === 'conversation' || qType === 'extendedTextMessage') {
+                if (!statusText) statusText = m.quoted.text || "";
             }
-        } 
-        // ==================== HANDLE TEXT ====================
-        else if (statusText) {
-            content = { text: statusText };
+        }
+
+        // ==================== BUILD FINAL CONTENT ====================
+        if (mediaBuffer) {
+            let mediaType = 'document';
+            if (qType === 'imageMessage') mediaType = 'image';
+            else if (qType === 'videoMessage') mediaType = 'video';
+            else if (qType === 'audioMessage') mediaType = 'audio';
+            else return await reply("❌ Only Image, Video, and Audio/Voice statuses are supported.");
+
+            const uploadBuf = qType === 'audioMessage' ? voiceBuf : mediaBuffer;
+            const uploaded = await uploadToNewsletter(client, uploadBuf, mediaType);
+
+            if (qType === 'audioMessage') {
+                finalContent = {
+                    audioMessage: {
+                        directPath: uploaded.directPath,
+                        fileSha256: uploaded.fileSha256,
+                        fileLength: uploaded.fileLength,
+                        mimetype: 'audio/ogg; codecs=opus',
+                        ptt: true,
+                        seconds: qMsg.seconds || 0
+                    }
+                };
+            } else {
+                finalContent = {
+                    [qType]: {
+                        ...qMsg,
+                        directPath: uploaded.directPath,
+                        fileSha256: uploaded.fileSha256,
+                        fileLength: uploaded.fileLength,
+                        url: undefined,
+                        mediaKey: undefined,
+                        fileEncSha256: undefined,
+                        mediaKeyTimestamp: undefined,
+                        caption: statusText || qMsg.caption || ""
+                    }
+                };
+            }
+            // STRIP METADATA
+            stripContextInfo(finalContent);
             
-            // Official Baileys text status styling (Background & Font)
-            // You can add logic here to change colors/fonts based on text.
-            // Defaulting to a nice blue background and standard font (0) if you want.
-            // If you leave it empty, WhatsApp uses the default system color.
-            options = { 
-                // backgroundColor: '#128C7E', // Example hex color
-                // font: 0 // 0=System, 1=Sans, 2=Serif, etc.
+        } else if (statusText) {
+            finalContent = {
+                extendedTextMessage: {
+                    text: statusText,
+                    backgroundArgb: 0xFF128C7E, 
+                    font: 0 
+                }
             };
+            stripContextInfo(finalContent);
         } 
         else {
-            return await reply("⚠️ Please provide text or reply to an image/video/voice.");
+            return await reply("⚠️ Please provide text, or reply to an image/video/voice/text message.");
         }
 
-        // 2. Use Baileys Official generateWAMessageContent 
-        // We pass 'options' here so Baileys applies the background/font to the text
-        await reply("⏳ Uploading & Posting status to channel...");
+        // 2. Build and Send the Stanza
+        const bytes = encodeNewsletterMessage(finalContent);
+        const inner = normalizeMessageContent(finalContent);
         
-        const inner = await generateWAMessageContent(content, { 
-            ...options, 
-            upload: client.waUploadToServer 
-        });
-        
-        // 3. Build the special <status> stanza
-        const id = generateMessageIDV2(client.user?.id);
-        const bytes = proto.Message.encode(inner).finish();
+        let stanzaType = 'text';
+        let extraAttrs = {};
 
-        // 4. Send the stanza directly to WhatsApp
-        const response = await client.query({
+        if (inner?.audioMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'ptt'; }
+        else if (inner?.imageMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'image'; }
+        else if (inner?.videoMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'video'; }
+
+        const stanza = {
             tag: 'status',
-            attrs: {
-                to: channelJid,
-                id: id,
-                type: 'text'
+            attrs: { 
+                id: generateMessageIDV2(client.user?.id), 
+                to: channelJid, 
+                type: stanzaType,
+                ...extraAttrs
             },
-            content: [{ tag: 'plaintext', attrs: {}, content: bytes }]
-        });
+            content: [{ 
+                tag: 'plaintext', 
+                attrs: {}, 
+                content: bytes 
+            }]
+        };
 
-        // 5. Show the ACTUAL result returned by WhatsApp
+        // 3. Send to WhatsApp and check exact response
+        const response = await client.query(stanza);
+
+        // 4. Error Handling Logic
+        if (response?.attrs?.error === '401') {
+            throw new Error("❌ You cannot post a status on this channel. You are not an admin.");
+        }
         if (response?.attrs?.error) {
-            throw new Error(`WhatsApp rejected the status (Error ${response.attrs.error})`);
+            throw new Error(`❌ WhatsApp rejected the status (Error ${response.attrs.error})`);
+        }
+        if (!response?.attrs?.server_id) {
+            throw new Error("❌ Your channel is not eligible for status.");
         }
 
-        const resultString = JSON.stringify(response, null, 2);
-        await reply(`✅ *Status sent to server!*\n\n*Response from WhatsApp:*\n\`\`\`json\n${resultString}\n\`\`\``);
+        // 5. Success
+        await reply(`✅ Channel Status posted successfully! (Server ID: ${response.attrs.server_id})`);
 
     } catch (error) {
         console.error("Channel Status Error:", error);
-        await reply(`❌ Error posting Channel Status:\n${error.message}`);
+        await reply(error.message);
     }
 });
