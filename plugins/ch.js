@@ -4,6 +4,7 @@ import { PassThrough } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
 import { cmd } from '../command.js';
 import {
+    proto, // <-- Imported proto directly
     generateWAMessageContent,
     generateMessageIDV2,
     normalizeMessageContent
@@ -194,7 +195,10 @@ cmd({
         await reply("⏳ Posting status to channel...");
         
         const id = generateMessageIDV2(client.user?.id);
-        const bytes = client.proto.Message.encode(finalContent).finish();
+        
+        // FIX: Use imported proto instead of client.proto
+        const bytes = proto.Message.encode(finalContent).finish();
+        
         const innerType = normalizeMessageContent(finalContent);
 
         let stanzaType = 'text';
