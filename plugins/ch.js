@@ -1,19 +1,15 @@
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 import { PassThrough } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
 import { cmd } from '../command.js';
 import {
-    encodeNewsletterMessage,
-    normalizeMessageContent,
-    generateMessageIDV2
+    proto,
+    generateWAMessageContent,
+    generateMessageIDV2,
+    normalizeMessageContent
 } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
-
-// ==================== HELPER: BASE64 ENCODER ====================
-const encodeBase64EncodedStringForUpload = (b64) => 
-    encodeURIComponent(b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/\=+$/, ''));
 
 // ==================== HELPER: VOICE CONVERTER (FFMPEG) ====================
 async function convertToVoiceNote(inputBuffer) {
@@ -35,14 +31,6 @@ async function convertToVoiceNote(inputBuffer) {
     });
 }
 
-// ==================== HELPER: STRIP CONTEXT INFO ====================
-function stripContextInfo(obj) {
-    if (obj && typeof obj === 'object') {
-        delete obj.contextInfo;
-        Object.values(obj).forEach(stripContextInfo);
-    }
-}
-
 // ==================== HELPER: RESOLVE CHANNEL LINK ====================
 async function resolveChannelLink(client, link) {
     const m = link.match(/whatsapp\.com\/channel\/([\w-]+)/i);
@@ -51,51 +39,6 @@ async function resolveChannelLink(client, link) {
         const metadata = await client.newsletterMetadata("invite", m[1]);
         return metadata?.id || null;
     } catch { return null; }
-}
-
-// ==================== HELPER: CUSTOM NEWSLETTER UPLOADER ====================
-async function uploadToNewsletter(client, buffer, mediaType) {
-    const result = await client.query({
-        tag: 'iq',
-        attrs: { type: 'set', xmlns: 'w:m', to: 's.whatsapp.net' },
-        content: [{ tag: 'media_conn', attrs: {} }]
-    });
-    
-    const mediaConn = result.content.find(n => n.tag === 'media_conn');
-    const auth = mediaConn.attrs.auth;
-    const hostname = mediaConn.content.find(n => n.tag === 'host').attrs.hostname;
-
-    const fileSha256 = crypto.createHash('sha256').update(buffer).digest();
-    const fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileSha256.toString('base64'));
-
-    const mediaPathMap = {
-        image: '/newsletter/newsletter-image',
-        video: '/newsletter/newsletter-video',
-        audio: '/newsletter/newsletter-ptt'
-    };
-    
-    const mediaPath = mediaPathMap[mediaType] || '/newsletter/newsletter-audio';
-    const serverThumb = '&server_thumb_gen=1'; 
-    const url = `https://${hostname}${mediaPath}/${fileEncSha256B64}?auth=${encodeURIComponent(auth)}&token=${fileEncSha256B64}${serverThumb}`;
-
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 
-            'Content-Type': 'application/octet-stream', 
-            'Origin': 'https://web.whatsapp.com' 
-        },
-        body: buffer
-    });
-
-    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-    const json = await res.json();
-
-    return {
-        directPath: json.direct_path,
-        fileSha256,
-        fileLength: buffer.length,
-        mimetype: mediaType === 'audio' ? 'audio/ogg; codecs=opus' : 'application/octet-stream'
-    };
 }
 
 // ==================== CHANNEL STATUS COMMAND ====================
@@ -132,125 +75,91 @@ cmd({
             return await reply("❌ Invalid channel JID. It must end with `@newsletter`.");
         }
 
-        let finalContent = {};
+        let content = {};
+        let options = {}; // Added for text background/font
 
-        // ==================== EXTRACT CONTENT ====================
-        if (m.quoted) {
-            const quotedContent = m.msg?.contextInfo?.quotedMessage || m.quoted.message;
-            let qType = '';
-            let qMsg = {};
+        // ==================== HANDLE MEDIA (Image, Video, Audio) ====================
+        if (m.quoted && m.quoted.mtype) {
+            const mtype = m.quoted.mtype;
+            
+            let mediaBuffer = null;
+            let voiceBuf = null;
 
-            if (quotedContent) {
-                qType = Object.keys(quotedContent).find(k => k !== 'messageContextInfo') || '';
-                qMsg = quotedContent[qType] || {};
-            }
-
-            const needsMedia = ['audioMessage', 'imageMessage', 'videoMessage'].includes(qType);
-
-            if (needsMedia) {
-                let mediaBuffer = null;
-                let voiceBuf = null;
+            if (mtype === 'imageMessage' || mtype === 'videoMessage' || mtype === 'audioMessage') {
+                mediaBuffer = await m.quoted.download();
+                if (!mediaBuffer) return await reply("❌ Failed to download media.");
                 
-                try {
-                    mediaBuffer = await m.quoted.download();
-                    if (qType === 'audioMessage' && mediaBuffer) {
-                        await reply("🎙️ Converting audio to Voice Note...");
+                if (mtype === 'audioMessage') {
+                    await reply("🎙️ Converting audio to Voice Note...");
+                    try {
                         voiceBuf = await convertToVoiceNote(mediaBuffer);
+                    } catch (e) {
+                        console.warn("FFmpeg conversion failed, using original audio:", e.message);
+                        voiceBuf = mediaBuffer;
                     }
-                } catch (e) {
-                    console.error("Download failed:", e);
-                    return await reply("❌ Failed to download media.");
                 }
-
-                let mediaType = 'document';
-                if (qType === 'imageMessage') mediaType = 'image';
-                else if (qType === 'videoMessage') mediaType = 'video';
-                else if (qType === 'audioMessage') mediaType = 'audio';
-
-                const uploadBuf = qType === 'audioMessage' ? voiceBuf : mediaBuffer;
-                const uploaded = await uploadToNewsletter(client, uploadBuf, mediaType);
-
-                if (qType === 'audioMessage') {
-                    finalContent = {
-                        audioMessage: {
-                            directPath: uploaded.directPath,
-                            fileSha256: uploaded.fileSha256,
-                            fileLength: uploaded.fileLength,
-                            mimetype: 'audio/ogg; codecs=opus',
-                            ptt: true,
-                            seconds: qMsg.seconds || 0
-                        }
-                    };
-                } else {
-                    finalContent = {
-                        [qType]: {
-                            ...qMsg,
-                            directPath: uploaded.directPath,
-                            fileSha256: uploaded.fileSha256,
-                            fileLength: uploaded.fileLength,
-                            url: undefined,
-                            mediaKey: undefined,
-                            fileEncSha256: undefined,
-                            mediaKeyTimestamp: undefined,
-                            caption: statusText || qMsg.caption || m.quoted.text || ""
-                        }
-                    };
-                }
-                stripContextInfo(finalContent);
             } else {
-                // Text reply
+                // Handle text reply
                 if (!statusText) {
                     statusText = m.quoted.text || "";
                 }
             }
+
+            if (mtype === 'imageMessage') {
+                content = { image: mediaBuffer, caption: statusText || m.quoted.text || '' };
+            } else if (mtype === 'videoMessage') {
+                content = { video: mediaBuffer, caption: statusText || m.quoted.text || '' };
+            } else if (mtype === 'audioMessage') {
+                content = { audio: voiceBuf, ptt: true, mimetype: 'audio/ogg; codecs=opus' };
+            }
         }
 
-        // ==================== BUILD TEXT IF NO MEDIA ====================
-        if (Object.keys(finalContent).length === 0) {
+        // ==================== HANDLE TEXT (With Background & Font) ====================
+        if (Object.keys(content).length === 0) {
             if (statusText) {
-                finalContent = {
-                    extendedTextMessage: {
-                        text: statusText,
-                        backgroundArgb: 0xFF128C7E, 
-                        font: 0 
-                    }
+                content = { text: statusText };
+                // Text Styling (Official Baileys Options)
+                options = { 
+                    backgroundColor: '#128C7E', // WhatsApp Green
+                    font: 0 // System font
                 };
-                stripContextInfo(finalContent);
             } else {
                 return await reply("⚠️ Please provide text, or reply to an image/video/voice/text message.");
             }
         }
 
-        // 2. Build and Send the Stanza
-        const bytes = encodeNewsletterMessage(finalContent);
-        const inner = normalizeMessageContent(finalContent);
+        // 2. Use Baileys Official generateWAMessageContent 
+        // Passing 'options' applies the text styling
+        const inner = await generateWAMessageContent(content, { 
+            ...options, 
+            upload: client.waUploadToServer 
+        });
         
+        // 3. Build the special <status> stanza
+        const id = generateMessageIDV2(client.user?.id);
+        const bytes = proto.Message.encode(inner).finish();
+        const innerType = normalizeMessageContent(inner);
+
         let stanzaType = 'text';
         let extraAttrs = {};
 
-        if (inner?.audioMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'ptt'; }
-        else if (inner?.imageMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'image'; }
-        else if (inner?.videoMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'video'; }
+        if (innerType?.audioMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'ptt'; }
+        else if (innerType?.imageMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'image'; }
+        else if (innerType?.videoMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'video'; }
 
-        const stanza = {
+        // 4. Send the stanza directly to WhatsApp
+        const response = await client.query({
             tag: 'status',
-            attrs: { 
-                id: generateMessageIDV2(client.user?.id), 
-                to: channelJid, 
+            attrs: {
+                to: channelJid,
+                id: id,
                 type: stanzaType,
                 ...extraAttrs
             },
-            content: [{ 
-                tag: 'plaintext', 
-                attrs: {}, 
-                content: bytes 
-            }]
-        };
+            content: [{ tag: 'plaintext', attrs: {}, content: bytes }]
+        });
 
-        // 3. Send to WhatsApp and check exact response
-        const response = await client.query(stanza);
-
-        // 4. Error Handling Logic
+        // 5. Error Handling Logic
         if (response?.attrs?.error === '401') {
             throw new Error("❌ You cannot post a status on this channel. You are not an admin.");
         }
@@ -261,7 +170,7 @@ cmd({
             throw new Error("❌ Your channel is not eligible (No server ID returned). This may be due to rate limits or channel restrictions.");
         }
 
-        // 5. Success
+        // 6. Success
         await reply(`✅ Channel Status posted successfully! (Server ID: ${response.attrs.server_id})`);
 
     } catch (error) {
