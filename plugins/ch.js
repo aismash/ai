@@ -1,20 +1,14 @@
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 import { PassThrough } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
 import { cmd } from '../command.js';
 import {
-    proto, // <-- Imported proto directly
+    proto,
     generateWAMessageContent,
-    generateMessageIDV2,
-    normalizeMessageContent
+    generateMessageIDV2
 } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
-
-// ==================== HELPER: BASE64 ENCODER ====================
-const encodeBase64EncodedStringForUpload = (b64) => 
-    encodeURIComponent(b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/\=+$/, ''));
 
 // ==================== HELPER: VOICE CONVERTER (FFMPEG) ====================
 async function convertToVoiceNote(inputBuffer) {
@@ -46,60 +40,15 @@ async function resolveChannelLink(client, link) {
     } catch { return null; }
 }
 
-// ==================== HELPER: CUSTOM UPLOAD TO NEWSLETTER ====================
-async function uploadToNewsletter(client, buffer, mediaType) {
-    const result = await client.query({
-        tag: 'iq',
-        attrs: { type: 'set', xmlns: 'w:m', to: 's.whatsapp.net' },
-        content: [{ tag: 'media_conn', attrs: {} }]
-    });
-    
-    const mediaConn = result.content.find(n => n.tag === 'media_conn');
-    const auth = mediaConn.attrs.auth;
-    const hostname = mediaConn.content.find(n => n.tag === 'host').attrs.hostname;
-
-    const fileSha256 = crypto.createHash('sha256').update(buffer).digest();
-    const fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileSha256.toString('base64'));
-
-    const mediaPathMap = {
-        image: '/newsletter/newsletter-image',
-        video: '/newsletter/newsletter-video',
-        audio: '/newsletter/newsletter-ptt'
-    };
-    
-    const mediaPath = mediaPathMap[mediaType] || '/newsletter/newsletter-audio';
-    const serverThumb = '&server_thumb_gen=1'; 
-    const url = `https://${hostname}${mediaPath}/${fileEncSha256B64}?auth=${encodeURIComponent(auth)}&token=${fileEncSha256B64}${serverThumb}`;
-
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 
-            'Content-Type': 'application/octet-stream', 
-            'Origin': 'https://web.whatsapp.com' 
-        },
-        body: buffer
-    });
-
-    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-    const json = await res.json();
-
-    return {
-        directPath: json.direct_path,
-        fileSha256,
-        fileLength: buffer.length,
-        mimetype: mediaType === 'audio' ? 'audio/ogg; codecs=opus' : 'application/octet-stream'
-    };
-}
-
 // ==================== CHANNEL STATUS COMMAND ====================
 cmd({
     pattern: "channelstatus",
     alias: ["cs", "newsstatus"],
     react: '📢',
-    desc: "Post a 24-hour status to a WhatsApp Channel (Newsletter) with media, voice, or text",
+    desc: "Post a 24-hour status to a WhatsApp Channel",
     category: "owner",
     filename: __filename
-}, async (client, message, m, { from, isCreator, text, reply }) => {
+}, async (client, message, m, { isCreator, text, reply }) => {
     try {
         if (!isCreator) {
             return await reply("*📛 This is an owner command.*");
@@ -126,106 +75,81 @@ cmd({
             return await reply("❌ Invalid channel JID. It must end with `@newsletter`.");
         }
 
-        let finalContent = {};
+        let content = {};
+        let options = {};
 
-        // ==================== HANDLE MEDIA ====================
+        // ==================== HANDLE MEDIA (Image, Video, Audio) ====================
         if (m.quoted && m.quoted.mtype) {
             let buffer = await m.quoted.download();
             if (!buffer) return await reply("❌ Failed to download media.");
 
             const mtype = m.quoted.mtype;
-            
-            let mediaType = null;
-            if (mtype === 'imageMessage') mediaType = 'image';
-            else if (mtype === 'videoMessage') mediaType = 'video';
-            else if (mtype === 'audioMessage') mediaType = 'audio';
-            else return await reply("❌ Only Image, Video, and Audio/Voice statuses are supported.");
 
-            // If it's audio, convert to a proper WhatsApp Voice Note using ffmpeg
-            if (mediaType === 'audio') {
+            if (mtype === 'imageMessage') {
+                content = { image: buffer, caption: statusText || m.quoted.text || '' };
+            } 
+            else if (mtype === 'videoMessage') {
+                content = { video: buffer, caption: statusText || m.quoted.text || '' };
+            } 
+            else if (mtype === 'audioMessage') {
                 await reply("🎙️ Converting audio to Voice Note...");
                 try {
                     buffer = await convertToVoiceNote(buffer);
                 } catch (e) {
                     console.warn("FFmpeg conversion failed, using original audio:", e.message);
                 }
-            }
-
-            await reply(`⏳ Uploading ${mediaType} to WhatsApp servers...`);
-            const uploaded = await uploadToNewsletter(client, buffer, mediaType);
-
-            if (mediaType === 'audio') {
-                finalContent = {
-                    audioMessage: {
-                        directPath: uploaded.directPath,
-                        fileSha256: uploaded.fileSha256,
-                        fileLength: uploaded.fileLength,
-                        mimetype: 'audio/ogg; codecs=opus',
-                        ptt: true,
-                        seconds: m.quoted.message?.audioMessage?.seconds || 0
-                    }
-                };
-            } else {
-                const qMsg = m.quoted.message?.[mtype] || {};
-                finalContent = {
-                    [mtype]: {
-                        ...qMsg,
-                        directPath: uploaded.directPath,
-                        fileSha256: uploaded.fileSha256,
-                        fileLength: uploaded.fileLength,
-                        caption: statusText || qMsg.caption || "",
-                        url: undefined,
-                        mediaKey: undefined,
-                        fileEncSha256: undefined,
-                        mediaKeyTimestamp: undefined
-                    }
-                };
+                content = { audio: buffer, ptt: true, mimetype: 'audio/ogg; codecs=opus' };
+            } 
+            else {
+                return await reply("❌ Unsupported media type. Only Image, Video, and Audio/Voice are supported.");
             }
         } 
         // ==================== HANDLE TEXT ====================
         else if (statusText) {
-            const inner = await generateWAMessageContent({ text: statusText }, { upload: client.waUploadToServer });
-            finalContent = inner;
+            content = { text: statusText };
+            
+            // Official Baileys text status styling (Background & Font)
+            // You can add logic here to change colors/fonts based on text.
+            // Defaulting to a nice blue background and standard font (0) if you want.
+            // If you leave it empty, WhatsApp uses the default system color.
+            options = { 
+                // backgroundColor: '#128C7E', // Example hex color
+                // font: 0 // 0=System, 1=Sans, 2=Serif, etc.
+            };
         } 
         else {
             return await reply("⚠️ Please provide text or reply to an image/video/voice.");
         }
 
-        // 2. Build the special <status> stanza
-        await reply("⏳ Posting status to channel...");
+        // 2. Use Baileys Official generateWAMessageContent 
+        // We pass 'options' here so Baileys applies the background/font to the text
+        await reply("⏳ Uploading & Posting status to channel...");
         
+        const inner = await generateWAMessageContent(content, { 
+            ...options, 
+            upload: client.waUploadToServer 
+        });
+        
+        // 3. Build the special <status> stanza
         const id = generateMessageIDV2(client.user?.id);
-        
-        // FIX: Use imported proto instead of client.proto
-        const bytes = proto.Message.encode(finalContent).finish();
-        
-        const innerType = normalizeMessageContent(finalContent);
+        const bytes = proto.Message.encode(inner).finish();
 
-        let stanzaType = 'text';
-        let extraAttrs = {};
-
-        if (innerType?.audioMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'ptt'; }
-        else if (innerType?.imageMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'image'; }
-        else if (innerType?.videoMessage) { stanzaType = 'media'; extraAttrs['mediatype'] = 'video'; }
-
-        // 3. Send the stanza directly to WhatsApp
+        // 4. Send the stanza directly to WhatsApp
         const response = await client.query({
             tag: 'status',
             attrs: {
                 to: channelJid,
                 id: id,
-                type: stanzaType,
-                ...extraAttrs
+                type: 'text'
             },
             content: [{ tag: 'plaintext', attrs: {}, content: bytes }]
         });
 
-        // 4. Check for errors in the WhatsApp response
+        // 5. Show the ACTUAL result returned by WhatsApp
         if (response?.attrs?.error) {
             throw new Error(`WhatsApp rejected the status (Error ${response.attrs.error})`);
         }
 
-        // 5. Show the ACTUAL result returned by WhatsApp
         const resultString = JSON.stringify(response, null, 2);
         await reply(`✅ *Status sent to server!*\n\n*Response from WhatsApp:*\n\`\`\`json\n${resultString}\n\`\`\``);
 
