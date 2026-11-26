@@ -2,11 +2,9 @@
 import { fileURLToPath } from 'url';
 import { cmd } from '../command.js';
 import config from '../config.js';
-import { downloadMediaMessage, normalizeMessageContent, getContentType } from '@whiskeysockets/baileys';
+import { downloadMediaMessage, getContentType } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
-
-// ---- Local helpers (extracted from the mod) ----
 
 const VIEW_ONCE_MEDIA = {
     imageMessage: 'image',
@@ -16,7 +14,6 @@ const VIEW_ONCE_MEDIA = {
     ptvMessage: 'ptv'
 };
 
-// Peel wrappers (ephemeral, viewOnce V1/V2/V2Extension, documentWithCaption, edited, etc.)
 const unwrapContent = (content) => {
     if (!content) return undefined;
     for (let i = 0; i < 5; i++) {
@@ -36,20 +33,16 @@ const unwrapContent = (content) => {
     return content;
 };
 
-// Detect whether content arrived inside a view-once wrapper (any depth)
 const seenViewOnceWrapper = (node, depth = 0) => {
     if (!node || depth > 5) return false;
     if (
         node.viewOnceMessage?.message ||
         node.viewOnceMessageV2?.message ||
         node.viewOnceMessageV2Extension?.message
-    ) {
-        return true;
-    }
+    ) return true;
     return seenViewOnceWrapper(node.ephemeralMessage?.message, depth + 1);
 };
 
-// Pure unwrap + detect: returns { media, mediaType, isViewOnce } or undefined
 const extractViewOnceMedia = (content) => {
     if (!content) return undefined;
     const wrapped = seenViewOnceWrapper(content);
@@ -61,34 +54,36 @@ const extractViewOnceMedia = (content) => {
     if (!mediaType) return undefined;
     const media = inner[innerType];
     const isViewOnce = wrapped || media?.viewOnce === true;
-    return { media, mediaType, isViewOnce };
+    return { media, mediaType, isViewOnce, contentType: innerType };
 };
 
-// Download with reupload-first when media has key but no URL (mirrors mod behavior)
 const downloadViewOnceMessage = async (message, type, options, ctx) => {
     const extracted = extractViewOnceMedia(message.message);
-    if (!extracted?.isViewOnce) {
-        throw new Error('message is not a view once media message');
-    }
+    if (!extracted) throw new Error('No view once media found in message');
+    if (!extracted.isViewOnce) throw new Error('Message is not view once');
 
     let msg = message;
     const { media } = extracted;
 
-    // No URL and no directPath -> ask sender to re-serve (needs reuploadRequest in ctx)
+    // Stub (no url / directPath / mediaKey) -> must ask sender to re-serve
     if (!media.url && !media.directPath) {
-        if (!media.mediaKey || !ctx?.reuploadRequest) {
+        if (!ctx?.reuploadRequest) {
             throw new Error(
-                'view once media has no download URL; pass reuploadRequest (sock.updateMediaMessage) to ask the sender to re-serve it'
+                'View-once media is a stub (no URL, no key). The sender must re-send it. ' +
+                'Ensure client.updateMediaMessage is available and the original message is in your store.'
             );
         }
-        console.log('[vv] no URL, requesting re-upload...');
+        console.log('[vv] no URL in quoted stub, requesting re-upload...');
         msg = await ctx.reuploadRequest(msg);
+        // After reupload, re-extract
+        const re = extractViewOnceMedia(msg.message);
+        if (!re?.media?.url && !re?.media?.directPath) {
+            throw new Error('Sender did not re-serve the media (still no URL).');
+        }
     }
 
     return downloadMediaMessage(msg, type, options, ctx);
 };
-
-// ---- Command ----
 
 cmd({
     pattern: "vv",
@@ -97,11 +92,7 @@ cmd({
     desc: "Owner Only - retrieve quoted message back to user",
     category: "owner",
     filename: __filename
-}, async (client, message, m, {
-    from,
-    isCreator,
-    userConfig
-}) => {
+}, async (client, message, m, { from, isCreator, userConfig }) => {
     try {
         if (!isCreator) {
             return await client.sendMessage(from, {
@@ -117,45 +108,78 @@ cmd({
             }, { quoted: message });
         }
 
-        // Build a fake WAMessage shape for the download helpers
-        const quotedMsg = {
-            key: m.quoted.key,
-            message: m.quoted.message,
-            messageTimestamp: m.quoted.messageTimestamp,
-            participant: m.quoted.participant
+        // ---- Rebuild a proper WAMessage from contextInfo ----
+        const ctxInfo = m.msg?.contextInfo || m.quoted?.contextInfo;
+        const quotedMessage =
+            ctxInfo?.quotedMessage ||
+            m.quoted?.message ||
+            (m.quoted?.mimetype !== undefined ? { imageMessage: m.quoted } : null);
+
+        if (!quotedMessage) {
+            return await client.sendMessage(from, {
+                text: "❌ Could not read quoted message content."
+            }, { quoted: message });
+        }
+
+        const quotedKey = {
+            remoteJid: from,
+            fromMe: ctxInfo?.participant === client.user?.id?.split(':')[0] + '@s.whatsapp.net'
+                ? true
+                : false,
+            id: ctxInfo?.stanzaId || m.quoted?.id,
+            participant: ctxInfo?.participant
         };
 
-        // Context for reupload fallback
+        const quotedMsg = {
+            key: quotedKey,
+            message: quotedMessage,
+            messageTimestamp: m.quoted?.messageTimestamp,
+            participant: ctxInfo?.participant
+        };
+
+        // Logger + reupload ctx
         const ctx = {
             logger: {
                 info: (...a) => console.log('[vv]', ...a),
                 warn: (...a) => console.warn('[vv]', ...a)
             },
+            // Official Baileys: sock.updateMediaMessage re-requests media for a given msg
             reuploadRequest: client.updateMediaMessage
                 ? (msg) => client.updateMediaMessage(msg)
                 : undefined
         };
 
+        const extracted = extractViewOnceMedia(quotedMessage);
+        const mediaType = extracted?.mediaType || 'image';
+        const originalCaption = m.quoted?.text || '';
+
         let buffer;
         try {
             buffer = await downloadViewOnceMessage(quotedMsg, 'buffer', {}, ctx);
-        } catch (e) {
-            // Fallback: plain download (handles non-viewOnce quoted media too)
-            buffer = await downloadMediaMessage(quotedMsg, 'buffer', {}, ctx);
+        } catch (e1) {
+            console.log('[vv] strict path failed:', e1.message);
+            try {
+                buffer = await downloadMediaMessage(quotedMsg, 'buffer', {}, ctx);
+            } catch (e2) {
+                throw new Error(
+                    `Could not download. Strict: ${e1.message} | Fallback: ${e2.message}`
+                );
+            }
         }
 
-        const extracted = extractViewOnceMedia(quotedMsg.message);
-        const mediaType = extracted?.mediaType || 'image';
-        const originalCaption = m.quoted.text || '';
-        const options = { quoted: message };
+        if (!buffer || !buffer.length) {
+            throw new Error('Downloaded buffer is empty.');
+        }
 
+        const options = { quoted: message };
         let messageContent = {};
+
         switch (mediaType) {
             case "image":
                 messageContent = {
                     image: buffer,
                     caption: originalCaption ? `${originalCaption}\n\n> ${DESCRIPTION}` : `> ${DESCRIPTION}`,
-                    mimetype: m.quoted.mimetype || "image/jpeg"
+                    mimetype: m.quoted?.mimetype || "image/jpeg"
                 };
                 break;
             case "video":
@@ -163,21 +187,21 @@ cmd({
                 messageContent = {
                     video: buffer,
                     caption: originalCaption ? `${originalCaption}\n\n> ${DESCRIPTION}` : `> ${DESCRIPTION}`,
-                    mimetype: m.quoted.mimetype || "video/mp4"
+                    mimetype: m.quoted?.mimetype || "video/mp4"
                 };
                 break;
             case "audio":
                 messageContent = {
                     audio: buffer,
                     mimetype: "audio/mp4",
-                    ptt: m.quoted.ptt || false
+                    ptt: m.quoted?.ptt || false
                 };
                 break;
             case "document":
                 messageContent = {
                     document: buffer,
-                    mimetype: m.quoted.mimetype || "application/octet-stream",
-                    fileName: m.quoted.fileName || "file"
+                    mimetype: m.quoted?.mimetype || "application/octet-stream",
+                    fileName: m.quoted?.fileName || "file"
                 };
                 break;
             default:
