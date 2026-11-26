@@ -1,4 +1,3 @@
-// plugins/audiosticker.js - ESM Version
 import { fileURLToPath } from 'url';
 import { cmd } from '../command.js';
 import config from '../config.js';
@@ -67,9 +66,6 @@ async function cleanStorage() {
 }
 
 // ==================== FFMPEG WRAPPER ====================
-/**
- * Run fluent-ffmpeg on a buffer, return { data, stderr }.
- */
 function ff(buffer, inExt, outExt, options = {}) {
     const id = randomBytes(6).toString('hex');
     const inFile = path.join(os.tmpdir(), `as_${id}.${inExt}`);
@@ -88,7 +84,6 @@ function ff(buffer, inExt, outExt, options = {}) {
             if (options.outputOptions) command.outputOptions(options.outputOptions);
 
             command
-                .on('start', cmd => { /* console.log('[ffmpeg]', cmd); */ })
                 .on('stderr', line => { stderr += line + '\n'; })
                 .on('error', async (err) => {
                     await fs.unlink(inFile).catch(() => {});
@@ -184,7 +179,12 @@ async function toSticker(buffer, kind, pack, author) {
     if (kind === 'video') data = await videoToWebp(buffer);
     else if (kind === 'image') data = await imageToWebp(buffer);
 
-    const json = { 'sticker-pack-id': 'com.rahman.audiosticker', 'sticker-pack-name': pack, 'sticker-pack-publisher': author, emojis: ['🎬'] };
+    const json = {
+        'sticker-pack-id': 'com.jawad.audiosticker',
+        'sticker-pack-name': pack,
+        'sticker-pack-publisher': author,
+        emojis: ['🎬']
+    };
     const head = Buffer.from([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00]);
     const body = Buffer.from(JSON.stringify(json), 'utf-8');
     const exif = Buffer.concat([head, body]);
@@ -352,7 +352,7 @@ cmd({
             }
             : null;
 
-        const quotedInfo = Object.values(content || {})
+        const quotedInfo = Object.values(content || [])
             .map(v => v && typeof v === 'object' && v.contextInfo)
             .find(c => c && c.quotedMessage);
 
@@ -423,8 +423,8 @@ cmd({
 
         await react('⏳');
         let [pack, author] = arg.split('|').map(v => v.trim());
-        pack = pack || botData?.botName || config.STICKER_NAME || 'ʀᴀʜᴍᴀɴ-ᴍᴅ';
-        author = author || config.STICKER_AUTHOR || 'ʀᴀʜᴍᴀɴ ᴛᴇᴄʜ';
+        pack = pack || botData?.botName || config.STICKER_NAME || 'JAWAD MD';
+        author = author || config.STICKER_AUTHOR || 'JawadTechX';
 
         const buffer = await media.download();
         const sticker = await toSticker(buffer, media.kind, pack, author);
